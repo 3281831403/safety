@@ -44,7 +44,11 @@ from safety.util import SafetyContext
 from .http_utils import parse_response
 
 from safety.config import AuthConfig
-from safety.errors import EnrollmentError, EnrollmentTransientFailure
+from safety.errors import (
+    EnrollmentError,
+    EnrollmentTransientFailure,
+    SSLCertificateError,
+)
 
 from safety.utils.auth_session import discard_token
 from safety.utils.tls_probe import probe_tls_connectivity
@@ -171,8 +175,10 @@ class SafetyPlatformClient:
         self._openid_config = None  # Cache for lazy loading
         self._jwks = None  # Cache for lazy loading JWKS
 
-        # Initialize and test TLS configuration
-        self._initialize_with_tls_fallback()
+        # TLS is verified lazily (see ensure_tls_ready): constructing the
+        # client must not perform network I/O, so that pure-local/offline
+        # commands (e.g. `check --db <local dir>`) work without connectivity.
+        self._tls_ready = False
 
     @staticmethod
     def _get_headers() -> Dict[str, str]:
@@ -236,6 +242,36 @@ class SafetyPlatformClient:
             )
         else:
             raise ValueError(f"Unexpected auth_type: {self._auth_type}")
+
+    def ensure_tls_ready(self) -> None:
+        """Verify TLS connectivity once, before the first network request.
+
+        Runs the lightweight HEAD probe (with certifi -> system trust-store
+        fallback) at most once per client. Non-TLS network errors (offline,
+        DNS failures, refused connections, timeouts) are logged and
+        swallowed: the actual request that follows will surface a precise
+        error to the caller.
+
+        Raises:
+            SSLCertificateError: If TLS cannot be established even after
+                the trust-store fallback.
+        """
+        if self._tls_ready:
+            return
+
+        try:
+            self._initialize_with_tls_fallback()
+        except SSLCertificateError:
+            raise
+        except Exception as e:
+            # Not a TLS problem (e.g. no network connectivity). Leave
+            # _tls_ready False so a later call can retry the probe.
+            logger.warning(
+                "TLS probe failed (%s); continuing without TLS verification.", e
+            )
+            return
+
+        self._tls_ready = True
 
     def _initialize_with_tls_fallback(self) -> None:
         """Initialize the client by testing TLS with a lightweight HEAD probe.
@@ -394,7 +430,7 @@ class SafetyPlatformClient:
         Returns:
             Any: The OpenID configuration.
         """
-
+        self.ensure_tls_ready()
         return self._http_client.get(url=self._openid_config_url, auth=None)
 
     def get_jwks(self, force_refresh: bool = False) -> Dict[str, List[Dict[str, Any]]]:
@@ -419,6 +455,7 @@ class SafetyPlatformClient:
         Returns:
             Dict[str, List[Dict[str, Any]]]: The keys.
         """
+        self.ensure_tls_ready()
         openid_config = self.get_openid_config()  # Use lazy-loaded config
         return self._http_client.get(url=openid_config["jwks_uri"], auth=None)  # type: ignore
 
@@ -430,6 +467,7 @@ class SafetyPlatformClient:
         Returns:
             Any: The user information.
         """
+        self.ensure_tls_ready()
         USER_INFO_ENDPOINT = f"{self._auth_server_url}/userinfo"
 
         r = self._http_client.get(url=USER_INFO_ENDPOINT)
@@ -467,6 +505,7 @@ class SafetyPlatformClient:
             "git_origin": git_origin,
         }
 
+        self.ensure_tls_ready()
         r = self._http_client.post(url=PLATFORM_API_PROJECT_CHECK_ENDPOINT, json=data)
 
         return r
@@ -484,6 +523,7 @@ class SafetyPlatformClient:
         """
         data = {"project": project_id}
 
+        self.ensure_tls_ready()
         return self._http_client.get(url=PLATFORM_API_PROJECT_ENDPOINT, params=data)
 
     @parse_response
@@ -507,6 +547,7 @@ class SafetyPlatformClient:
             "branch": branch,
         }
 
+        self.ensure_tls_ready()
         return self._http_client.get(url=PLATFORM_API_POLICY_ENDPOINT, params=data)
 
     @parse_response
@@ -522,6 +563,7 @@ class SafetyPlatformClient:
         """
         data = {"project_id": project_id}
 
+        self.ensure_tls_ready()
         return self._http_client.post(
             url=PLATFORM_API_PROJECT_SCAN_REQUEST_ENDPOINT, json=data
         )
@@ -537,7 +579,7 @@ class SafetyPlatformClient:
         Returns:
             Any: The upload result.
         """
-
+        self.ensure_tls_ready()
         return self._http_client.post(
             url=PLATFORM_API_PROJECT_UPLOAD_SCAN_ENDPOINT,
             content=json_report,
@@ -551,6 +593,7 @@ class SafetyPlatformClient:
         Returns:
             Any: The result of the upload operation.
         """
+        self.ensure_tls_ready()
         return self._http_client.post(
             url=PLATFORM_API_REQUIREMENTS_UPLOAD_SCAN_ENDPOINT,
             json=json_payload,
@@ -589,6 +632,7 @@ class SafetyPlatformClient:
             "os_description": os_description,
         }
 
+        self.ensure_tls_ready()
         return self._http_client.get(
             url=PLATFORM_API_CHECK_UPDATES_ENDPOINT, params=data
         )
@@ -614,6 +658,7 @@ class SafetyPlatformClient:
 
         data = {"packages": [{"package_specifier": package} for package in packages]}
 
+        self.ensure_tls_ready()
         return self._http_client.post(url=url, json=data)
 
     @parse_response
@@ -624,6 +669,7 @@ class SafetyPlatformClient:
         Returns:
             Any: The initialization result.
         """
+        self.ensure_tls_ready()
         return self._http_client.get(
             url=PLATFORM_API_INITIALIZE_ENDPOINT,
             timeout=5,
@@ -643,9 +689,9 @@ class SafetyPlatformClient:
     ) -> dict:
         """Enroll a machine with the Safety Platform.
 
-        Uses the instance's already-configured HTTP client (TLS and proxy
-        were probed during ``__init__``), then retries the POST up to 3
-        times on transient network errors.
+        Uses the instance's already-configured HTTP client (TLS is probed
+        lazily via :meth:`ensure_tls_ready` before the request), then
+        retries the POST up to 3 times on transient network errors.
 
         Args:
             enrollment_base_url: Base URL for the enrollment API
@@ -666,6 +712,7 @@ class SafetyPlatformClient:
             httpx.ConnectError: On network errors (retried, then re-raised).
             httpx.TimeoutException: On timeouts (retried, then re-raised).
         """
+        self.ensure_tls_ready()
         return self._enroll_post(
             self._http_client,
             enrollment_base_url,

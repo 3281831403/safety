@@ -178,13 +178,13 @@ class TestSafetyPlatformClientMachineToken:
             )
         assert isinstance(client._http_client, OAuth2Client)
 
-    # -- 4. _initialize_with_tls_fallback() runs probe but skips OpenID config fetch --
+    # -- 4. ensure_tls_ready() runs probe but skips OpenID config fetch --
 
     @_PATCH_META
     def test_tls_init_skips_openid_config_fetch(self, _mock_meta, _mock_probe):
-        """machine_token path should run TLS probe but skip OpenID config fetch."""
+        """machine_token path should run TLS probe lazily, skipping OpenID config fetch."""
         with patch.object(SafetyPlatformClient, "get_openid_config") as mock_openid:
-            SafetyPlatformClient(
+            client = SafetyPlatformClient(
                 base_url="https://api.example.com",
                 tls_config=_make_tls_config(),
                 auth_server_url="https://auth.example.com",
@@ -193,7 +193,12 @@ class TestSafetyPlatformClientMachineToken:
                 machine_id="machine-001",
                 machine_token="sfmt_abc123",
             )
-        # Probe IS called (via class-level patch), but OpenID config is NOT
+            # Construction performs no network I/O
+            _mock_probe.assert_not_called()
+
+            client.ensure_tls_ready()
+
+        # Probe IS called lazily (via class-level patch), OpenID config is NOT
         _mock_probe.assert_called()
         mock_openid.assert_not_called()
 
@@ -544,13 +549,14 @@ class TestTlsInitUnifiedPath:
     """
 
     @_PATCH_META
-    def test_tls_probe_runs_for_api_key_client(self, _mock_meta):
-        """API-key path should run probe_tls_connectivity during init."""
+    def test_tls_probe_is_lazy_for_api_key_client(self, _mock_meta):
+        """API-key path must not probe TLS during init; the probe runs on
+        the first ensure_tls_ready() call instead."""
         with patch(
             "safety.platform.client.probe_tls_connectivity",
             side_effect=_stub_probe,
         ) as mock_probe:
-            SafetyPlatformClient(
+            client = SafetyPlatformClient(
                 base_url="https://api.example.com",
                 tls_config=_make_tls_config(),
                 auth_server_url="https://auth.example.com",
@@ -558,11 +564,19 @@ class TestTlsInitUnifiedPath:
                 auth_type=AuthenticationType.api_key,
                 api_key="test-api-key",
             )
-        mock_probe.assert_called_once()
+            # Construction performs no network I/O
+            mock_probe.assert_not_called()
+
+            client.ensure_tls_ready()
+            mock_probe.assert_called_once()
+
+            # Idempotent: no second probe
+            client.ensure_tls_ready()
+            mock_probe.assert_called_once()
 
     @_PATCH_META
     def test_lazy_openid_fetch_uses_fallen_back_tls_config(self, _mock_meta):
-        """After TLS fallback during init, get_openid_config() should use the recreated client."""
+        """After TLS fallback, get_openid_config() should use the recreated client."""
         tls_original = _make_tls_config()
         tls_system = _make_tls_config()
         tls_system.mode = "system"
@@ -582,6 +596,11 @@ class TestTlsInitUnifiedPath:
                 auth_type=AuthenticationType.api_key,
                 api_key="test-api-key",
             )
+
+            # No probe during init: original TLS config still in place
+            assert client._tls_config is tls_original
+
+            client.ensure_tls_ready()
 
         # Client should have been recreated with the fallen-back TLS config
         assert client._tls_config is tls_system
@@ -643,6 +662,8 @@ class TestSafetyPlatformClientEnrollment:
         # attributes to guard against future AttributeError surprises.
         instance.base_url = "https://test.example.com"
         instance._timeout = 30.0
+        # enroll() calls ensure_tls_ready(); skip the network probe here.
+        instance._tls_ready = True
         return instance, mock_http
 
     # -- 1. 200 success --

@@ -2,6 +2,7 @@ import logging
 from typing import Dict, Optional, Any, Callable
 
 import click
+import httpx
 
 from .main import (
     TYPE_CHECKING,
@@ -206,13 +207,14 @@ def configure_auth_session(
 
     # Load machine credentials on every invocation (coexists with OAuth2)
     machine_creds = MachineCredentialConfig.from_storage()
+    stored_auth_config = AuthConfig.from_storage()
 
     # Resolve the auth type ONCE.  Priority: API Key > OAuth2 > Machine Token.
     if key:
         resolved_auth = AuthenticationType.api_key
     elif (
         machine_creds
-        and not AuthConfig.from_storage()
+        and not stored_auth_config
         and not _is_oauth2_flow_command(ctx)
     ):
         resolved_auth = AuthenticationType.machine_token
@@ -248,11 +250,28 @@ def configure_auth_session(
 
     platform_client = _create_platform_client(**client_kwargs)
 
-    jwks = (
-        None
-        if resolved_auth == AuthenticationType.machine_token
-        else platform_client.get_jwks()
-    )
+    # Credentialed flows verify TLS connectivity up front (with trust-store
+    # fallback). Pure-local/offline invocations (no API key, no machine
+    # credentials, no stored OAuth2 token) skip this entirely, so commands
+    # like `safety check --db <local dir>` or `safety generate` keep working
+    # with no network at all.
+    if resolved_auth != AuthenticationType.token or stored_auth_config:
+        platform_client.ensure_tls_ready()
+
+    # JWKS is only needed to verify a stored OAuth2 token; the API-key and
+    # machine-token flows never use it. A fetch failure (e.g. offline) must
+    # not abort the bootstrap: the session simply stays unauthenticated,
+    # and pure-local commands can still run.
+    jwks: Optional[Dict[str, Any]] = None
+    if resolved_auth == AuthenticationType.token and stored_auth_config:
+        try:
+            jwks = platform_client.get_jwks()
+        except httpx.HTTPError as e:
+            logger.warning(
+                "Unable to fetch JWKS (%s); continuing without the stored "
+                "OAuth2 token.",
+                e,
+            )
 
     auth = Auth(
         stage=stage,
@@ -272,8 +291,11 @@ def configure_auth_session(
         assert machine_creds is not None
         SafetyContext().account = f"machine:{machine_creds.machine_id}"
     else:
-        if not platform_client.api_key:
-            platform_client.load_auth_token_from_storage(jwks=jwks or {})
+        # Only load the stored token when its JWKS could be fetched;
+        # otherwise leave the stored credentials untouched (a transient
+        # network failure must not discard them).
+        if not platform_client.api_key and jwks is not None:
+            platform_client.load_auth_token_from_storage(jwks=jwks)
 
         info = get_auth_info(ctx.obj.auth)
 

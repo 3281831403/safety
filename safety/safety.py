@@ -375,6 +375,13 @@ def fetch_database(
     """
     Fetches the database from a mirror or a local file.
 
+    Mirror selection priority:
+        1. An explicit ``db`` location (--db / SAFETY_DB_DIR), whether a
+           local directory or a remote mirror URL — always wins, even when
+           credentials are configured.
+        2. The authenticated API mirrors, when auth credentials are in use.
+        3. The open mirrors (no credentials required).
+
     Args:
         http_client (OAuth2Client): The OAuth2 client.
         platform (SafetyPlatformClient): The Safety Platform client.
@@ -397,10 +404,14 @@ def fetch_database(
         )
 
     is_open_mirror = False
-    if auth.platform.is_using_auth_credentials():
-        mirrors = API_MIRRORS
-    elif db:
+    if db:
+        # An explicit database location (--db / SAFETY_DB_DIR) always takes
+        # priority, even when credentials are configured: a local directory
+        # is read from disk and a remote mirror URL is used as-is. This
+        # keeps pure-local/offline runs fully offline.
         mirrors = [db]
+    elif auth.platform.is_using_auth_credentials():
+        mirrors = API_MIRRORS
     else:
         is_open_mirror = True
         mirrors = OPEN_MIRRORS

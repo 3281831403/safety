@@ -88,12 +88,13 @@ def _mock_403_response(detail_msg="Forbidden", auth_header=""):
 
 
 @pytest.mark.unit
+@_PATCH_PROBE
 class TestMachineTokenEndpointRestriction:
     """Tests for 403 handling when using machine token authentication."""
 
     @_PATCH_META
     def test_machine_token_403_raises_with_specific_message_and_credential(
-        self, _mock_meta
+        self, _mock_meta, _mock_probe
     ):
         """Machine token auth + 403 should raise InvalidCredentialError
         with MSG_MACHINE_TOKEN_NOT_ACCEPTED and credential='machine token'."""
@@ -113,7 +114,7 @@ class TestMachineTokenEndpointRestriction:
             assert exc_info.value.credential == "machine token"
 
     @_PATCH_META
-    def test_machine_token_403_on_post_endpoint(self, _mock_meta):
+    def test_machine_token_403_on_post_endpoint(self, _mock_meta, _mock_probe):
         """Machine token auth + 403 on a POST endpoint should also raise
         with MSG_MACHINE_TOKEN_NOT_ACCEPTED."""
         client = _build_machine_token_client()
@@ -133,11 +134,14 @@ class TestMachineTokenEndpointRestriction:
 
 
 @pytest.mark.unit
+@_PATCH_PROBE
 class TestNonMachineToken403Handling:
     """Tests for 403 handling when NOT using machine token authentication."""
 
     @_PATCH_META
-    def test_api_key_403_raises_generic_error_with_credential(self, _mock_meta):
+    def test_api_key_403_raises_generic_error_with_credential(
+        self, _mock_meta, _mock_probe
+    ):
         """API key auth + 403 should raise InvalidCredentialError with
         generic 'Failed authentication' credential, NOT MSG_MACHINE_TOKEN_NOT_ACCEPTED,
         and include the server detail in the error message."""

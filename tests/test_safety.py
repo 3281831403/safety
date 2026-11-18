@@ -461,6 +461,92 @@ class TestSafety(unittest.TestCase):
         self.assertNotEqual(resp, licenses_db)
         self.assertEqual(resp, original_db)
 
+    def test_fetch_database_explicit_local_db_wins_over_credentials(self):
+        """
+        Verify that an explicit local database (--db / SAFETY_DB_DIR) takes
+        priority over the authenticated API mirrors: with credentials
+        configured, the local file is used and no remote mirror is contacted.
+        """
+        self.auth.platform.is_using_auth_credentials.return_value = True
+
+        valid_db = {"meta": {"schema_version": "2.0.0"}}
+
+        with (
+            patch(
+                "safety.safety.fetch_database_file", return_value=valid_db
+            ) as mock_file,
+            patch("safety.safety.fetch_database_url") as mock_url,
+        ):
+            data = fetch_database(
+                auth=self.auth, db="/local/db/dir", cached=0, telemetry=False
+            )
+
+        self.assertEqual(data, valid_db)
+        mock_file.assert_called_once()
+        # The local path must be the mirror used, not an API mirror
+        self.assertEqual(mock_file.call_args[0][0], "/local/db/dir")
+        mock_url.assert_not_called()
+
+    def test_fetch_database_explicit_remote_mirror_wins_over_credentials(self):
+        """
+        Verify that an explicit remote mirror URL takes priority over the
+        default authenticated API mirrors.
+        """
+        self.auth.platform.is_using_auth_credentials.return_value = True
+
+        valid_db = {"meta": {"schema_version": "2.0.0"}}
+
+        with patch(
+            "safety.safety.fetch_database_url", return_value=valid_db
+        ) as mock_url:
+            data = fetch_database(
+                auth=self.auth,
+                db="https://mirror.example.com/db/",
+                cached=0,
+                telemetry=False,
+            )
+
+        self.assertEqual(data, valid_db)
+        mock_url.assert_called_once()
+        self.assertEqual(mock_url.call_args[0][1], "https://mirror.example.com/db/")
+
+    @patch("safety.safety.fetch_database_url")
+    def test_fetch_database_credentials_use_api_mirrors_without_explicit_db(
+        self, mock_url
+    ):
+        """
+        Verify that without an explicit --db, authenticated sessions fetch
+        from the API mirrors (not the open mirrors).
+        """
+        from safety.constants import API_MIRRORS
+
+        self.auth.platform.is_using_auth_credentials.return_value = True
+        mock_url.return_value = {"meta": {"schema_version": "2.0.0"}}
+
+        fetch_database(auth=self.auth, db=False, cached=0, telemetry=False)
+
+        mock_url.assert_called_once()
+        self.assertEqual(mock_url.call_args[0][1], API_MIRRORS[0])
+        # API mirrors are not open mirrors
+        self.assertFalse(mock_url.call_args[1]["is_open_mirror"])
+
+    @patch("safety.safety.fetch_database_url")
+    def test_fetch_database_anonymous_uses_open_mirrors(self, mock_url):
+        """
+        Verify that without credentials and without an explicit --db, the
+        open mirrors are used.
+        """
+        from safety.constants import OPEN_MIRRORS
+
+        self.auth.platform.is_using_auth_credentials.return_value = False
+        mock_url.return_value = {"meta": {"schema_version": "2.0.0"}}
+
+        fetch_database(auth=self.auth, db=False, cached=0, telemetry=False)
+
+        mock_url.assert_called_once()
+        self.assertEqual(mock_url.call_args[0][1], OPEN_MIRRORS[0])
+        self.assertTrue(mock_url.call_args[1]["is_open_mirror"])
+
     def test_fetch_database_rejects_machine_token(self):
         """
         Verify that fetch_database() raises DatabaseFetchError when using

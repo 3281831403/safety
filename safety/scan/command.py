@@ -1,6 +1,7 @@
 # type: ignore
 from enum import Enum
 import logging
+import os
 from pathlib import Path
 
 import json
@@ -453,12 +454,19 @@ def validate_authentication(ctx: typer.Context) -> None:
     """
     Validates that the user is authenticated.
 
+    Scanning against a local vulnerability database (SAFETY_DB_DIR) is a
+    pure-local/offline operation and does not require platform
+    authentication.
+
     Args:
         ctx (typer.Context): The Typer context object.
 
     Raises:
         SafetyError: If the user is not authenticated.
     """
+    if os.getenv("SAFETY_DB_DIR"):
+        return
+
     if not ctx.obj.metadata.authenticated:
         raise SafetyError(MSG_AUTH_REQUIRED)
 

@@ -115,8 +115,10 @@ class TestPrecedenceHierarchy:
 
         _run_configure(patches, key="my-api-key")
 
-        # JWKS should be fetched (non-machine path)
-        mock_platform.get_jwks.assert_called_once()
+        # Credentialed flow: TLS is probed up front. JWKS is not fetched:
+        # the API-key path never uses it.
+        mock_platform.ensure_tls_ready.assert_called_once()
+        mock_platform.get_jwks.assert_not_called()
         # _create_platform_client should receive api_key auth_type
         mock_create = patches[f"{_MOD}._create_platform_client"]
         call_kwargs = mock_create.call_args.kwargs
@@ -135,8 +137,10 @@ class TestPrecedenceHierarchy:
 
         _run_configure(patches)
 
-        # JWKS should be fetched (OAuth2 path, not machine)
+        # JWKS should be fetched (OAuth2 path with a stored token, not machine)
         mock_platform.get_jwks.assert_called_once()
+        # Credentialed flow: TLS is probed up front
+        mock_platform.ensure_tls_ready.assert_called_once()
         # auth_type should be token (OAuth2)
         mock_create = patches[f"{_MOD}._create_platform_client"]
         call_kwargs = mock_create.call_args.kwargs
@@ -154,6 +158,8 @@ class TestPrecedenceHierarchy:
 
         # JWKS fetch should be SKIPPED
         mock_platform.get_jwks.assert_not_called()
+        # Credentialed flow (machine token): TLS is probed up front
+        mock_platform.ensure_tls_ready.assert_called_once()
         # auth_type should be machine_token
         mock_create = patches[f"{_MOD}._create_platform_client"]
         call_kwargs = mock_create.call_args.kwargs
@@ -193,6 +199,8 @@ class TestPrecedenceHierarchy:
 
         The client may have no token loaded yet, so get_authentication_type()
         will return ``none`` — but the resolved auth_type is ``token``.
+        With no credentials in play, the bootstrap performs no network I/O
+        (no TLS probe, no JWKS fetch) so pure-local/offline commands work.
         """
         patches, mock_platform = _build_patches(
             machine_creds=None,
@@ -201,8 +209,9 @@ class TestPrecedenceHierarchy:
 
         _run_configure(patches)
 
-        # JWKS should be fetched (standard path)
-        mock_platform.get_jwks.assert_called_once()
+        # No credentials: no TLS probe, no JWKS fetch
+        mock_platform.ensure_tls_ready.assert_not_called()
+        mock_platform.get_jwks.assert_not_called()
         # auth_type should be token (OAuth2 path)
         mock_create = patches[f"{_MOD}._create_platform_client"]
         call_kwargs = mock_create.call_args.kwargs
@@ -230,15 +239,48 @@ class TestAuthJwksForMachineToken:
 
     @pytest.mark.unit
     def test_auth_jwks_is_populated_on_non_machine_path(self) -> None:
+        # A stored OAuth2 token is what triggers the JWKS fetch on the
+        # token path.
         patches, mock_platform = _build_patches(
+            machine_creds=None,
+            oauth2_config=MagicMock(),
+        )
+
+        ctx = _run_configure(patches)
+        auth: Auth = ctx.obj.auth
+        # Non-machine path with a stored token should have fetched JWKS
+        assert auth.jwks == {"keys": [{"kid": "1"}]}
+
+    @pytest.mark.unit
+    def test_auth_jwks_is_none_without_stored_token(self) -> None:
+        patches, _ = _build_patches(
             machine_creds=None,
             oauth2_config=None,
         )
 
         ctx = _run_configure(patches)
         auth: Auth = ctx.obj.auth
-        # Non-machine path should have fetched JWKS
-        assert auth.jwks == {"keys": [{"kid": "1"}]}
+        # Nothing to verify without a stored token: JWKS is not fetched
+        assert auth.jwks is None
+
+    @pytest.mark.unit
+    def test_jwks_fetch_failure_keeps_session_unauthenticated(self) -> None:
+        """A JWKS network failure must not abort the bootstrap nor discard
+        the stored credentials: the session degrades to unauthenticated."""
+        import httpx
+
+        patches, mock_platform = _build_patches(
+            machine_creds=None,
+            oauth2_config=MagicMock(),
+        )
+        mock_platform.get_jwks.side_effect = httpx.ConnectError("offline")
+
+        ctx = _run_configure(patches)
+        auth: Auth = ctx.obj.auth
+        assert auth.jwks is None
+        # The stored token must NOT be loaded (which would discard it on
+        # validation failure)
+        mock_platform.load_auth_token_from_storage.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -610,8 +652,9 @@ class TestCommandBasedAuthSelection:
 
         _run_configure(patches, protected_args=["auth", "login"])
 
-        # OAuth2 path: JWKS should be fetched
-        mock_platform.get_jwks.assert_called_once()
+        # OAuth2 path without a stored token: JWKS is not fetched at
+        # bootstrap (the login flow fetches it lazily after login)
+        mock_platform.get_jwks.assert_not_called()
         # Machine creds should NOT be passed to client
         mock_create = patches[f"{_MOD}._create_platform_client"]
         call_kwargs = mock_create.call_args.kwargs
@@ -628,7 +671,7 @@ class TestCommandBasedAuthSelection:
 
         _run_configure(patches, protected_args=["auth", "register"])
 
-        mock_platform.get_jwks.assert_called_once()
+        mock_platform.get_jwks.assert_not_called()
         mock_create = patches[f"{_MOD}._create_platform_client"]
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs.get("machine_id") is None
@@ -643,7 +686,7 @@ class TestCommandBasedAuthSelection:
 
         _run_configure(patches, protected_args=["auth"])
 
-        mock_platform.get_jwks.assert_called_once()
+        mock_platform.get_jwks.assert_not_called()
         mock_create = patches[f"{_MOD}._create_platform_client"]
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs.get("machine_id") is None
