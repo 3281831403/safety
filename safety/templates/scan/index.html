@@ -177,6 +177,7 @@
                                     {% for dependency in file.results.dependencies %}
                                         {% for spec in dependency.specifications %}
                                             {% for vulnerability in spec.vulnerabilities %}
+                                                {% if not vulnerability.ignored %}
                                                 <tr>
                                                     <td><a href="{{ vulnerability.more_info_url }}" target="_blank">{{ vulnerability.vulnerability_id }}</a></td>
                                                     <td>{{vulnerability.package_name}}</td>
@@ -194,9 +195,10 @@
                                                         {% endif %}
                                                     </td>
                                                 </tr>
+                                                {% endif %}
                                             {% endfor %}
                                         {% endfor %}
-                                    {% endfor %}    
+                                    {% endfor %}
                                     </tbody>
                                 </table>
                             </div>

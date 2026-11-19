@@ -240,7 +240,7 @@ def print_summary(
         f"Tested [number]{dependencies_count}[/number] {pluralize('dependency', dependencies_count)} for security issues using {policy_msg}"
     )
 
-    if total_issues_with_duplicates == 0:
+    if total_issues_with_duplicates == 0 and total_ignored_issues == 0:
         console.print("0 security issues found, 0 fixes suggested.")
     else:
         # Print security issues and ignored vulnerabilities
@@ -564,7 +564,6 @@ def render_scan_html(report: ReportModel, obj: Any) -> str:
 
     scanned_packages = 0
     affected_packages = 0
-    ignored_packages = 0
     remediations_recommended = 0
     ignored_vulnerabilities = 0
     vulnerabilities = 0
@@ -574,16 +573,19 @@ def render_scan_html(report: ReportModel, obj: Any) -> str:
     for file in project.files:
         scanned_packages += len(file.results.dependencies)
         affected_packages += len(file.results.get_affected_dependencies())
-        ignored_vulnerabilities += len(file.results.ignored_vulns)
+        # Count vulnerabilities actually ignored, not the number of
+        # configured ignore rules (unmatched rules must not inflate this)
+        ignored_vulnerabilities += len(file.results.ignored_vulns_data)
 
         for spec in file.results.get_affected_specifications():
-            vulnerabilities += len(spec.vulnerabilities)
-            vulns_per_file[file.location] += len(spec.vulnerabilities)
+            unignored_vulns = [
+                vuln for vuln in spec.vulnerabilities if not vuln.ignored
+            ]
+            vulnerabilities += len(unignored_vulns)
+            vulns_per_file[file.location] += len(unignored_vulns)
             if spec.remediation:
                 remed_per_file[file.location] += 1
                 remediations_recommended += 1
-
-        ignored_packages += len(file.results.ignored_vulns)
 
     # TODO: Get this information for the report model (?)
     summary = {

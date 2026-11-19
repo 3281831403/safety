@@ -206,46 +206,46 @@ def process_report(
     report_to_output = None
 
     with console.status(WAIT_MSG_PROCESSING_REPORT, spinner=DEFAULT_SPINNER) as status:
-        spdx_format, html_format = None, None
+        spdx_export_format, spdx_output_format, html_format = None, None, None
 
-        if ScanExport.is_format(export_type, ScanExport.SPDX) or ScanOutput.is_format(
-            output, ScanOutput.SPDX
-        ):
-            spdx_version = None
-            if export_type:
-                spdx_version = (
-                    export_type.version
-                    if export_type.version
-                    and ScanExport.is_format(export_type, ScanExport.SPDX)
-                    else None
-                )
+        # Render SPDX per target so each side honors its own version parameter
+        if ScanExport.is_format(export_type, ScanExport.SPDX):
+            spdx_export_format = render_scan_spdx(
+                report, obj, spdx_version=export_type.version
+            )
 
-            if not spdx_version and output:
-                spdx_version = (
-                    output.version
-                    if output.version and ScanOutput.is_format(output, ScanOutput.SPDX)
-                    else None
-                )
-
-            spdx_format = render_scan_spdx(report, obj, spdx_version=spdx_version)
+        if ScanOutput.is_format(output, ScanOutput.SPDX):
+            spdx_output_format = render_scan_spdx(
+                report, obj, spdx_version=output.version
+            )
 
         if export_type is ScanExport.HTML or output is ScanOutput.HTML:
             html_format = render_scan_html(report, obj)
 
+        # Apply JSON transformations once so stdout and --save-as stay
+        # isomorphic
+        json_report = json_format
+
+        if detailed_output:
+            json_report = add_cve_details_to_report(json_report, obj.project.files)
+
+        if filter_keys:
+            json_report = filter_json_keys(json_report, filter_keys)
+
         save_as_format_mapping = {
-            ScanExport.JSON: json_format,
+            ScanExport.JSON: json_report,
             ScanExport.HTML: html_format,
-            ScanExport.SPDX: spdx_format,
-            ScanExport.SPDX_2_3: spdx_format,
-            ScanExport.SPDX_2_2: spdx_format,
+            ScanExport.SPDX: spdx_export_format,
+            ScanExport.SPDX_2_3: spdx_export_format,
+            ScanExport.SPDX_2_2: spdx_export_format,
         }
 
         output_format_mapping = {
-            ScanOutput.JSON: json_format,
+            ScanOutput.JSON: json_report,
             ScanOutput.HTML: html_format,
-            ScanOutput.SPDX: spdx_format,
-            ScanOutput.SPDX_2_3: spdx_format,
-            ScanOutput.SPDX_2_2: spdx_format,
+            ScanOutput.SPDX: spdx_output_format,
+            ScanOutput.SPDX_2_3: spdx_output_format,
+            ScanOutput.SPDX_2_2: spdx_output_format,
         }
 
         report_to_export = save_as_format_mapping.get(export_type, None)
@@ -304,19 +304,8 @@ def process_report(
         console.quiet = False
 
         if output is ScanOutput.JSON or ScanOutput.is_format(output, ScanOutput.SPDX):
-            if output is ScanOutput.JSON:
-                if detailed_output:
-                    report_to_output = add_cve_details_to_report(
-                        report_to_output, obj.project.files
-                    )
-
-                if filter_keys:
-                    report_to_output = filter_json_keys(report_to_output, filter_keys)
-
-                kwargs = {"json": report_to_output}
-            else:
-                kwargs = {"data": report_to_output}
-            console.print_json(**kwargs)
+            # Both JSON and SPDX reports are JSON documents at this point
+            console.print_json(json=report_to_output)
 
         else:
             console.print(report_to_output)
@@ -391,6 +380,8 @@ def generate_cve_details(files: List[FileModel]) -> List[Dict[str, Any]]:
     for file in files:
         for spec in file.results.get_affected_specifications():
             for vuln in spec.vulnerabilities:
+                if vuln.ignored:
+                    continue
                 if vuln.CVE:
                     cve_data.append(
                         {
@@ -921,7 +912,7 @@ def scan(
     # Step 5: Initialize data structures and counters for analysis
     files: List[FileModel] = []
     to_fix_files = []
-    ignored_vulns_data = iter([])
+    ignored_vulns_data: Dict[str, Vulnerability] = {}
     config = ctx.obj.config
     count = 0  # Total dependencies processed
     affected_count = 0
@@ -947,6 +938,9 @@ def scan(
         ):
             # Update counts and track vulnerabilities
             count += len(analyzed_file.dependency_results.dependencies)
+            ignored_vulns_data.update(
+                analyzed_file.dependency_results.ignored_vulns_data
+            )
             if exit_code == 0 and analyzed_file.dependency_results.failed:
                 exit_code = EXIT_CODE_VULNERABILITIES_FOUND
 
@@ -1081,14 +1075,15 @@ def scan(
 
     print_summary(
         console=console,
-        total_issues_with_duplicates=total_issues_with_duplicates,
+        total_issues_with_duplicates=total_issues_with_duplicates
+        - total_ignored_issues,
         total_ignored_issues=total_ignored_issues,
         project=ctx.obj.project,
         dependencies_count=count,
         fixes_count=fixes_count,
         resolved_vulns_per_fix=total_resolved_vulns,
         is_detailed_output=detailed_output,
-        ignored_vulns_data=ignored_vulns_data,
+        ignored_vulns_data=ignored_vulns_data.values(),
     )
 
     # Process report and upload if required
