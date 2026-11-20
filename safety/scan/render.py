@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 import sys
 
 from rich.console import Console
+from rich.markup import escape
 from rich.padding import Padding
 from rich.prompt import Prompt
 from rich.text import Text
@@ -36,6 +37,7 @@ from safety.util import clean_project_id, get_basic_announcements
 if TYPE_CHECKING:
     from safety.cli_util import CustomContext
     from safety.models import SafetyCLI
+    from safety.scan.ecosystems.base import SkippedRequirement
 
     SafetyContext = CustomContext[SafetyCLI]
 
@@ -185,6 +187,90 @@ def print_fixes_section(
     console.print("-" * console.size.width)
 
 
+def _resolved(value) -> str:
+    """
+    Normalizes a path for comparison, tolerating plain strings.
+
+    Args:
+        value: A path or path-like value.
+
+    Returns:
+        str: The resolved path, or the original value as a string.
+    """
+    try:
+        return str(Path(value).resolve())
+    except (OSError, TypeError, ValueError):
+        return str(value)
+
+
+def print_skipped_dependencies(
+    console: Console,
+    skipped: List["SkippedRequirement"],
+    path: Path,
+    target: Path,
+    file_type: Optional[FileType] = None,
+) -> None:
+    """
+    Prints the requirement lines that were excluded from the scan set for a
+    file, along with the reason for each skip.
+
+    Args:
+        console (Console): The console object used to print formatted output.
+        skipped (List[SkippedRequirement]): The skipped requirement lines.
+        path (Path): The path of the file the lines were found in.
+        target (Path): The scan target, used to display a relative path.
+        file_type (Optional[FileType]): The type reported for the file, used
+            for formats detected under a generic type.
+    """
+    from ..util import pluralize
+
+    count = len(skipped)
+
+    try:
+        location = path.relative_to(target)
+    except ValueError:
+        location = path
+
+    label = ""
+    # Files discovered under a generic file type (setup.cfg, Pipfile,
+    # requirements.in) are reported with the format they were parsed as.
+    if file_type is not None and not path.name.lower().endswith(file_type.value):
+        label = f" (parsed as {file_type.value})"
+
+    console.print(
+        Padding(
+            f":warning: [number]{count}[/number] {pluralize('requirement', count)} "
+            f"skipped in [file_title]{escape(str(location))}[/file_title]{label}: pip would "
+            "not install them in this environment or Safety cannot analyze them:",
+            (0, 0, 0, 1),
+        ),
+        emoji=True,
+    )
+
+    current_source = _resolved(path)
+
+    for item in skipped:
+        # Requirement lines are not rich markup: a spec like ``django[argon2]``
+        # must be shown verbatim instead of being parsed as a tag.
+        origin = ""
+
+        if item.line_number is not None:
+            origin = f" (line {item.line_number})"
+
+        # Lines pulled in through ``-r`` come from another file; name it so
+        # the skip remains traceable.
+        if item.source and _resolved(item.source) != current_source:
+            origin += f" in {escape(item.source)}"
+
+        console.print(
+            Padding(
+                f"- {escape(item.raw)}{origin}: {escape(item.detail)}",
+                (0, 0, 0, 2),
+            ),
+            emoji=True,
+        )
+
+
 def print_summary(
     console: Console,
     total_issues_with_duplicates: int,
@@ -195,6 +281,7 @@ def print_summary(
     resolved_vulns_per_fix: int = 0,
     is_detailed_output: bool = False,
     ignored_vulns_data: Optional[Dict[str, Vulnerability]] = None,
+    skipped_count: int = 0,
 ) -> None:
     """
     Prints a concise summary of scan results including vulnerabilities, fixes, and ignored vulnerabilities.
@@ -213,6 +300,7 @@ def print_summary(
         resolved_vulns_per_fix (int, optional): The number of vulnerabilities that can be resolved by the suggested fixes. Defaults to 0.
         is_detailed_output (bool, optional): Flag to indicate whether detailed output, especially for ignored vulnerabilities, should be shown. Defaults to False.
         ignored_vulns_data (Optional[Dict[str, Vulnerability]], optional): A dictionary of vulnerabilities that were ignored, categorized by their reason for being ignored. Defaults to None.
+        skipped_count (int, optional): The number of requirement lines kept out of the scan set because pip would not install them in this environment or Safety cannot analyze them. Defaults to 0.
 
     Returns:
         None: This function does not return any value. It prints the summary to the console.
@@ -253,10 +341,16 @@ def print_summary(
         f"[number]{fixes_count}[/number] {pluralize('fix', fixes_count)} suggested, resolving [number]{resolved_vulns_per_fix}[/number] vulnerabilities."
     )
 
-    if is_detailed_output:
-        if not ignored_vulns_data:
-            ignored_vulns_data = iter([])
+    if skipped_count:
+        console.print(
+            f"[number]{skipped_count}[/number] {pluralize('requirement', skipped_count)} "
+            "skipped: pip would not install them in this environment or Safety "
+            "cannot analyze them. See the per-file skipped sections above."
+        )
 
+    # Ignored vulnerabilities must always be traceable; only the per-issue
+    # detail rendering depends on --detailed-output.
+    if ignored_vulns_data:
         manual_ignored = {}
         cvss_severity_ignored = {}
         cvss_severity_ignored_pkgs = set()
@@ -282,15 +376,18 @@ def print_summary(
         if manual_ignored:
             count = len(manual_ignored)
             console.print(
-                f"[number]{count}[/number] were manually ignored due to the project policy:"
+                f"[number]{count}[/number] {pluralize('vulnerability', count)} "
+                f"{pluralize('was', count)} manually ignored due to the project "
+                f"policy: {', '.join(sorted(manual_ignored))}"
             )
-            for vuln in manual_ignored.values():
-                render_to_console(
-                    vuln,
-                    console,
-                    rich_kwargs={"emoji": True, "overflow": "crop"},
-                    detailed_output=is_detailed_output,
-                )
+            if is_detailed_output:
+                for vuln in manual_ignored.values():
+                    render_to_console(
+                        vuln,
+                        console,
+                        rich_kwargs={"emoji": True, "overflow": "crop"},
+                        detailed_output=is_detailed_output,
+                    )
         if cvss_severity_ignored:
             count = len(cvss_severity_ignored)
             console.print(

@@ -7,6 +7,7 @@ import datetime
 
 from safety.scan.render import (
     print_announcements,
+    print_skipped_dependencies,
     print_summary,
     render_header,
     prompt_project_id,
@@ -165,6 +166,99 @@ class TestRender(unittest.TestCase):
                 ),
             ]
         )
+
+    def test_print_summary_reports_skipped_and_ignored_without_detailed_output(self):
+        ignored_vulns_data = [
+            MagicMock(
+                ignored_code=IgnoreCodes.unpinned_specification.value,
+                vulnerability_id="v3",
+                package_name="django",
+            ),
+            MagicMock(
+                ignored_code=IgnoreCodes.environment_dependency.value,
+                vulnerability_id="v4",
+                package_name="p4",
+            ),
+        ]
+
+        print_summary(
+            self.console,
+            total_issues_with_duplicates=3,
+            total_ignored_issues=2,
+            project=self.project,
+            dependencies_count=2,
+            fixes_count=0,
+            resolved_vulns_per_fix=0,
+            is_detailed_output=False,
+            ignored_vulns_data=ignored_vulns_data,
+            skipped_count=2,
+        )
+
+        printed = " ".join(
+            str(call_args.args[0]) for call_args in self.console.print.call_args_list
+        )
+
+        # Skip count is reported even without --detailed-output.
+        self.assertIn("[number]2[/number] requirements skipped", printed)
+        # Ignored vulnerabilities are traceable by reason without
+        # --detailed-output.
+        self.assertIn("unpinned specs: django", printed)
+        self.assertIn("inside an environment dependency", printed)
+        self.assertNotIn("manually ignored", printed)
+
+    def test_print_skipped_dependencies_lists_reason_per_line(self):
+        from safety.scan.ecosystems.base import SkippedRequirement, SkipReason
+
+        console = MagicMock()
+        print_skipped_dependencies(
+            console,
+            [
+                SkippedRequirement(
+                    raw='django==1.6 ; python_version < "3"',
+                    reason=SkipReason.ENVIRONMENT_MARKER,
+                    detail="marker does not match",
+                    line_number=1,
+                )
+            ],
+            Path("/tmp/project/requirements.txt"),
+            Path("/tmp/project"),
+        )
+
+        printed = " ".join(
+            str(call_args.args[0]) for call_args in console.print.call_args_list
+        )
+        self.assertIn("[number]1[/number] requirement skipped", printed)
+        self.assertIn("requirements.txt", printed)
+        self.assertIn("marker does not match", printed)
+        self.assertIn("(line 1)", printed)
+
+    def test_print_skipped_dependencies_names_included_file_and_escapes_markup(self):
+        from safety.scan.ecosystems.base import SkippedRequirement, SkipReason
+
+        console = MagicMock()
+        print_skipped_dependencies(
+            console,
+            [
+                SkippedRequirement(
+                    raw="git+https://example.com/x.git#egg=[pkg]",
+                    reason=SkipReason.VCS_DEPENDENCY,
+                    detail="VCS dependency",
+                    source="/tmp/project/base.txt",
+                    line_number=2,
+                )
+            ],
+            Path("/tmp/project/requirements.txt"),
+            Path("/tmp/project"),
+        )
+
+        printed = " ".join(
+            str(call_args.args[0]) for call_args in console.print.call_args_list
+        )
+        # The line pulled in through -r names the file it came from...
+        self.assertIn("base.txt", printed)
+        self.assertIn("(line 2)", printed)
+        # ...and the raw requirement is escaped, not interpreted as markup.
+        self.assertIn("\\[pkg]", printed)
 
     @patch("safety.scan.render.clean_project_id")
     @patch("sys.stdin.isatty", return_value=True)

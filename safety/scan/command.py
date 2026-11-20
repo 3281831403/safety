@@ -55,6 +55,7 @@ from safety.scan.models import (
 from safety.scan.render import (
     print_detected_ecosystems_section,
     print_fixes_section,
+    print_skipped_dependencies,
     print_summary,
     render_scan_html,
     render_scan_spdx,
@@ -193,6 +194,9 @@ def process_report(
     """
     with console.status(WAIT_MSG_PROCESSING_REPORT, spinner=DEFAULT_SPINNER) as status:
         json_format = report.as_v30().json()
+        project_files = getattr(getattr(obj, "project", None), "files", None)
+        if project_files:
+            json_format = add_skipped_dependencies_to_report(json_format, project_files)
 
     export_type, export_path = None, None
 
@@ -424,6 +428,56 @@ def add_cve_details_to_report(report_to_output: str, files: List[FileModel]) -> 
     cve_details = generate_cve_details(files)
     report_dict = json.loads(report_to_output)
     report_dict["cve_details"] = cve_details
+    return json.dumps(report_dict)
+
+
+def add_skipped_dependencies_to_report(
+    report_to_output: str, files: List[FileModel]
+) -> str:
+    """
+    Add the skipped requirement lines (with their reasons) to the JSON
+    report, so exclusions from the scan set stay traceable.
+
+    Args:
+        report_to_output (str): The current JSON string of the report.
+        files (List[FileModel]): List of scanned files; files that had
+            skipped lines carry a ``skipped_dependencies`` attribute.
+
+    Returns:
+        str: The updated JSON string with skipped dependencies added.
+    """
+    skipped_by_location = {}
+
+    for file in files or []:
+        skipped = getattr(file, "skipped_dependencies", None)
+        if skipped:
+            skipped_by_location[str(file.location)] = skipped
+
+    if not skipped_by_location:
+        return report_to_output
+
+    try:
+        report_dict = json.loads(report_to_output)
+    except ValueError:
+        return report_to_output
+
+    scan_results = report_dict.get("scan_results", {}) or {}
+    locations: List[Dict[str, Any]] = []
+
+    # Files are emitted both at the top level and, for project scans, nested
+    # in each project; annotate every occurrence.
+    for file_obj in scan_results.get("files", []) or []:
+        locations.append(file_obj)
+
+    for project in scan_results.get("projects", []) or []:
+        for file_obj in project.get("files", []) or []:
+            locations.append(file_obj)
+
+    for file_obj in locations:
+        skipped = skipped_by_location.get(file_obj.get("location"))
+        if skipped:
+            file_obj.setdefault("results", {})["skipped_dependencies"] = skipped
+
     return json.dumps(report_dict)
 
 
@@ -742,6 +796,25 @@ def generate_remediation_details(
     return lines, total_resolved_vulns, fixes_count
 
 
+def is_fixable_requirements_file(path: Path) -> bool:
+    """
+    Determines whether a discovered file can safely be rewritten by
+    ``--apply-fixes``.
+
+    Only real ``requirements*.txt`` files support automated rewriting. The
+    other dependency formats the finder reports as ``REQUIREMENTS_TXT``
+    (``setup.cfg``, ``Pipfile`` and pip-tools ``.in`` sources) are scanned but
+    must be updated by their own tooling.
+
+    Args:
+        path (Path): The discovered file path.
+
+    Returns:
+        bool: True if the file can be auto-fixed.
+    """
+    return path.name.lower().endswith(".txt")
+
+
 def should_display_fix_suggestion(
     ctx: typer.Context,
     analyzed_file: Any,
@@ -921,13 +994,14 @@ def scan(
     # Step 5: Initialize data structures and counters for analysis
     files: List[FileModel] = []
     to_fix_files = []
-    ignored_vulns_data = iter([])
+    ignored_vulns_data: Dict[str, Vulnerability] = {}
     config = ctx.obj.config
     count = 0  # Total dependencies processed
     affected_count = 0
     exit_code = 0
     fixes_count = 0
     total_resolved_vulns = 0
+    skipped_count = 0  # Requirement lines excluded from the scan set
     fix_file_types = [
         fix_target[0] if isinstance(fix_target[0], str) else fix_target[0].value
         for fix_target in fixes_target
@@ -950,6 +1024,20 @@ def scan(
             if exit_code == 0 and analyzed_file.dependency_results.failed:
                 exit_code = EXIT_CODE_VULNERABILITIES_FOUND
 
+            # Track vulnerabilities ignored by policy so their reasons can be
+            # reported, and requirement lines excluded from the scan set.
+            ignored_vulns_data.update(
+                analyzed_file.dependency_results.ignored_vulns_data
+            )
+            skipped = getattr(analyzed_file, "skipped_dependencies", []) or []
+
+            if skipped:
+                skipped_count += len(skipped)
+                console.print()
+                print_skipped_dependencies(
+                    console, skipped, path, target, analyzed_file.file_type
+                )
+
             affected_specifications = (
                 analyzed_file.dependency_results.get_affected_specifications()
             )
@@ -963,7 +1051,10 @@ def scan(
 
             # Prepare to collect files needing fixes
             to_fix_spec = []
-            file_matched_for_fix = analyzed_file.file_type.value in fix_file_types
+            file_matched_for_fix = analyzed_file.file_type.value in fix_file_types and (
+                analyzed_file.file_type is not FileType.REQUIREMENTS_TXT
+                or is_fixable_requirements_file(path)
+            )
 
             # Handle files with affected specifications
             if any(affected_specifications):
@@ -1031,14 +1122,18 @@ def scan(
                 )
 
             # Track whether to suggest applying fixes
-            display_apply_fix_suggestion = should_display_fix_suggestion(
-                ctx, analyzed_file, affected_specifications, apply_updates
+            display_apply_fix_suggestion = (
+                display_apply_fix_suggestion
+                or should_display_fix_suggestion(
+                    ctx, analyzed_file, affected_specifications, apply_updates
+                )
             )
 
-            # Track if a requirements.txt file was found
+            # Track if an auto-fixable requirements.txt file was found
             if (
                 not requirements_txt_found
                 and analyzed_file.file_type is FileType.REQUIREMENTS_TXT
+                and is_fixable_requirements_file(path)
             ):
                 requirements_txt_found = True
 
@@ -1048,6 +1143,9 @@ def scan(
                 file_type=analyzed_file.file_type,
                 results=analyzed_file.dependency_results,
             )
+            # Kept out of the schema models; injected into JSON exports by
+            # add_skipped_dependencies_to_report.
+            file.skipped_dependencies = [item.to_dict() for item in skipped]
 
             if file_matched_for_fix:
                 to_fix_files.append((file, to_fix_spec))
@@ -1088,7 +1186,8 @@ def scan(
         fixes_count=fixes_count,
         resolved_vulns_per_fix=total_resolved_vulns,
         is_detailed_output=detailed_output,
-        ignored_vulns_data=ignored_vulns_data,
+        ignored_vulns_data=ignored_vulns_data.values(),
+        skipped_count=skipped_count,
     )
 
     # Process report and upload if required
